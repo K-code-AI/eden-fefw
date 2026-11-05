@@ -1,0 +1,193 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#pragma once
+
+#include <array>
+#include <atomic>
+#include <bit>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <thread>
+#include <type_traits>
+#include <vector>
+
+#include "common/common_types.h"
+
+namespace Core {
+class System;
+}
+
+namespace Tegra::Engines {
+class EngineInterface;
+}
+
+namespace VideoCommon {
+
+// Ordered engine worker adapted from Eglantine 46967a1b84e857a783ace6dcbabffddd008463ff.
+// The command reader retains coherent readbacks and drains before accessing engine state.
+class GpuSplit {
+public:
+    static GpuSplit& Get() {
+        return instance;
+    }
+
+    /// Whether the front sends work to the back (front thread only).
+    [[nodiscard]] bool Active() const {
+        return active;
+    }
+    /// EDEN_TEST_GPU_SPLIT=2 also moves native graphics macros onto the front.
+    [[nodiscard]] bool FrontMacros() const {
+        return front_macros;
+    }
+
+    /// Opt-in with EDEN_TEST_GPU_SPLIT=1. Called by the front between submissions.
+    static bool Requested();
+    void MaybeStart(Core::System& system, bool native_channel);
+    bool IsDrained() const { return consumed_cache == write_position; }
+    void Stop();
+    void RegisterFrontend(Tegra::Engines::EngineInterface* engine);
+
+    /// An engine method write, executed as DmaPusher would (method sink, ConsumeSink, call).
+    /// `segment`: the engine's current_dma_segment for the call, when the engine reads it.
+    void Method(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument, bool is_last,
+                const GPUVAddr* segment) {
+        SelectEngine(engine);
+        const size_t words = segment != nullptr ? 2 : 1;
+        u64* const entry = Reserve(words);
+        entry[0] = static_cast<u64>(Kind::Method) | (is_last ? IsLast : 0) |
+                   (segment != nullptr ? HasSegment : 0) | (u64{method & 0xffff} << 8) |
+                   (u64{argument} << 32);
+        if (segment != nullptr) {
+            entry[1] = *segment;
+        }
+        Commit(words);
+    }
+    void MultiMethod(Tegra::Engines::EngineInterface* engine, u32 method, const u32* words,
+                     u32 amount, u32 methods_pending, const GPUVAddr* segment);
+    /// A write made by a macro: CallMethod without the method sink, as the engines' macros do.
+    void MacroWrite(Tegra::Engines::EngineInterface* engine, u32 method, u32 argument) {
+        SelectEngine(engine);
+        u64* const entry = Reserve(1);
+        entry[0] = static_cast<u64>(Kind::Method) | IsLast | Direct | (u64{method & 0xffff} << 8) |
+                   (u64{argument} << 32);
+        Commit(1);
+    }
+
+    /// Runs `func` on the back after everything sent before it. Must be trivially copyable.
+    template <typename Func>
+    void Defer(const Func& func) {
+        static_assert(std::is_trivially_copyable_v<Func> && alignof(Func) <= alignof(u64));
+        constexpr size_t payload = (sizeof(Func) + sizeof(u64) - 1) / sizeof(u64);
+        u64* const entry = Reserve(2 + payload);
+        entry[0] = static_cast<u64>(Kind::Call) | (u64{payload} << 8);
+        entry[1] = reinterpret_cast<u64>(&CallThunk<Func>);
+        std::memcpy(entry + 2, &func, sizeof(Func));
+        Commit(2 + payload);
+    }
+    void DeferFunction(std::function<void()>&& func);
+
+    /// EDEN_TEST_GPU_SPLIT_CHECK=1: reports, with its stack, a thread other than the back
+    /// using back-owned state (the Vulkan scheduler) while the back runs entries.
+    static inline bool check_owner{};
+    static void CheckOwner(const char* where);
+
+    /// Makes what was sent visible to the back.
+    void Publish();
+    /// Waits until the back executed everything sent so far.
+    void Drain();
+
+    /// Compute or copy work was just sent: what can write GPU-written command lists.
+    void NoteWriter() {
+        last_writer_position = write_position;
+    }
+    /// Waits until the back executed the compute and copy work sent so far (not what came after).
+    void WaitForWriters();
+
+private:
+    enum class Kind : u64 {
+        Wrap,   ///< The rest of the ring is unused: continue at its start
+        Engine, ///< The engine the next methods go to: word 1
+        Method, ///< Bits 8-23 method, 32-63 argument; flags IsLast, HasSegment (word 1)
+        Multi,  ///< Bits 8-23 method, 32-63 amount; word 1 methods pending, [segment], words
+        Call,   ///< Bits 8-31 payload size in words; word 1 thunk, then the payload
+    };
+    static constexpr u64 IsLast = 1 << 4;
+    static constexpr u64 HasSegment = 1 << 5;
+    static constexpr u64 Direct = 1 << 6; ///< Method: call it even if not executable (macros)
+
+    static constexpr size_t RingWords = size_t{1} << 20; // 8 MiB
+    static constexpr size_t RingMask = RingWords - 1;
+    static constexpr u32 MaxMultiWords = 8192;
+    static constexpr size_t PublishEvery = 256;
+
+    template <typename Func>
+    static void CallThunk(const u64* payload) {
+        std::array<std::byte, sizeof(Func)> bytes;
+        std::memcpy(bytes.data(), payload, sizeof(Func));
+        std::bit_cast<Func>(bytes)();
+    }
+
+    /// Room for an entry of `words` at the write position (never across the ring's end).
+    u64* Reserve(size_t words) {
+        const size_t index = write_position & RingMask;
+        if (index + words <= RingWords && write_position + words - consumed_cache <= RingWords)
+            {
+            return &ring[index];
+        }
+        return ReserveSlow(words);
+    }
+    u64* ReserveSlow(size_t words);
+    void Commit(size_t words) {
+        write_position += words;
+        if (write_position - published_local >= publish_every) {
+            Publish();
+        }
+    }
+    void WaitForSpace(size_t words);
+    void SelectEngine(Tegra::Engines::EngineInterface* engine) {
+        if (engine != front_engine) {
+            SwitchEngine(engine);
+        }
+    }
+    void SwitchEngine(Tegra::Engines::EngineInterface* engine);
+
+    void PublishConsumed(u64 position);
+    void WaitForProgress(u64 observed);
+    void BackLoop(std::stop_token stop_token);
+    size_t Execute(const u64* entry);
+
+    Core::System* system{};
+    bool active{};
+    bool front_macros{};
+    std::vector<Tegra::Engines::EngineInterface*> frontend_engines;
+    std::unique_ptr<u64[]> ring;
+
+    // Front side.
+    u64 write_position{};
+    u64 last_writer_position{};
+    u64 published_local{};
+    u64 consumed_cache{};
+    /// Words between publishes: small right after a drain, while the back has nothing to do.
+    size_t publish_every{PublishEvery};
+    Tegra::Engines::EngineInterface* front_engine{};
+
+    // Back side.
+    Tegra::Engines::EngineInterface* back_engine{};
+
+    static GpuSplit instance;
+
+    alignas(64) std::atomic<u64> published{};
+    alignas(64) std::atomic<u64> consumed{};
+    /// A position the front waits for (WaitForWriters): the back stores `consumed` once past it.
+    alignas(64) std::atomic<u64> wait_target{~u64{0}};
+    alignas(64) std::atomic<bool> back_waiting{};
+    std::atomic<u32> wake{};
+    alignas(64) std::atomic<bool> front_waiting{};
+    std::atomic<u32> front_wake{};
+    std::jthread back_thread;
+};
+
+} // namespace VideoCommon
+

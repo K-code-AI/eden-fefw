@@ -1,0 +1,25 @@
+Building Eden FE: Fortune's Weave v1.02-perf1
+=============================================
+
+eden-fefw\           full source of this build (Eden FE v1.02 plus the
+                     performance changes)
+pgo-crowd-20261104\  the compiler profile (eden.pgd) and the CMake include
+                     that applies it
+cmake-options.txt    the project options from the release build's CMake cache
+
+The release eden.exe was built on Windows with Visual Studio 2026
+(MSVC 19.51.36260.0, x64, Ninja, Release). From an x64 Developer Command
+Prompt in this folder, with the build folder beside pgo-crowd-20261104:
+
+  cmake -S eden-fefw -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+    -DCMAKE_EXE_LINKER_FLAGS:STRING=/machine:x64 ^
+    "-DCMAKE_PROJECT_yuzu_INCLUDE:FILEPATH=%CD%\pgo-crowd-20261104\link-profile.cmake" ^
+    -DEDEN_LOCAL_PROFILE_STAGE:STRING=USE -DEDEN_LOCAL_RENDER_ISA:STRING=AVX512
+  cmake --build build --target yuzu
+
+EDEN_LOCAL_RENDER_ISA=AVX512 compiles five Vulkan renderer files for AVX-512.
+Use AVX2 for CPUs without AVX-512. The profile only matches this exact source
+and compiler; with anything else the linker warns and builds without it.
+Leaving out CMAKE_PROJECT_yuzu_INCLUDE gives a normal build without the
+profile. The configure step downloads the dependencies listed in
+cpmfile.json, as in upstream Eden.
